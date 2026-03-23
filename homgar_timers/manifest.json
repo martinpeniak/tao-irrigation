@@ -1,0 +1,10 @@
+{
+  "domain": "homgar_timers",
+  "name": "HomGar Irrigation Timers",
+  "version": "1.0.0",
+  "requirements": ["paho-mqtt>=1.6.0"],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "cloud_push",
+  "config_flow": false
+}

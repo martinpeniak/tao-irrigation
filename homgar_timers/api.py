@@ -1,0 +1,126 @@
+"""HomGar Cloud API client.
+
+Authentication (reverse-engineered from homgar_api.py v0.2.9):
+  - Endpoint:  /auth/basic/app/login  (NOT /app/user/login)
+  - Password:  MD5(password.encode()).hexdigest()
+  - DeviceId:  MD5((email + area_code).encode()).hexdigest()
+  - Headers:   Content-Type: application/json, lang: en, appCode: 1
+  - Auth token used in subsequent requests as "auth" header (not Authorization)
+"""
+import hashlib
+import json
+import logging
+import urllib.request
+import urllib.error
+from typing import Any
+
+from .const import (
+    HOMGAR_BASE_URL, HOMGAR_LOGIN_PATH,
+    HOMGAR_HOMES_PATH, HOMGAR_DEVICES_PATH, TIMER_MODEL,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class HomGarApiError(Exception):
+    pass
+
+
+class HomGarApi:
+    def __init__(self, email: str, password: str, area_code: str):
+        self._email = email
+        self._password = password
+        self._area_code = area_code
+        self._token: str | None = None
+        self._iot_credentials: dict | None = None
+
+    def _headers(self) -> dict:
+        if not self._token:
+            raise HomGarApiError("Not logged in")
+        return {"auth": self._token, "lang": "en", "appCode": "1",
+                "Content-Type": "application/json"}
+
+    def _get(self, path: str, params: dict | None = None) -> Any:
+        url = HOMGAR_BASE_URL + path
+        if params:
+            url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        req = urllib.request.Request(url, headers=self._headers())
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode())
+            if data.get("code") != 0:
+                raise HomGarApiError(f"API error: {data}")
+            return data.get("data")
+        except urllib.error.HTTPError as e:
+            raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
+
+
+    def login(self) -> dict:
+        """Login and return Alibaba IoT credentials for MQTT."""
+        pwd_md5 = hashlib.md5(self._password.encode("utf-8")).hexdigest()
+        device_id = hashlib.md5((self._email + self._area_code).encode("utf-8")).hexdigest()
+        payload = json.dumps({
+            "areaCode": self._area_code,
+            "phoneOrEmail": self._email,
+            "password": pwd_md5,
+            "deviceId": device_id,
+        }).encode()
+        req = urllib.request.Request(
+            HOMGAR_BASE_URL + HOMGAR_LOGIN_PATH, data=payload,
+            headers={"Content-Type": "application/json", "lang": "en", "appCode": "1"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            raise HomGarApiError(f"Login HTTP {e.code}: {e.read().decode()[:200]}")
+        if data.get("code") != 0:
+            raise HomGarApiError(f"Login failed: {data}")
+        d = data["data"]
+        self._token = d["token"]
+        host_port = d["mqttHostUrl"]
+        self._iot_credentials = {
+            "iot_id": d["user"]["iotId"],
+            "product_key": d["user"]["productKey"],
+            "device_name": d["user"]["deviceName"],
+            "device_secret": d["user"]["deviceSecret"],
+            "mqtt_host": host_port.split(":")[0],
+            "mqtt_port": int(host_port.split(":")[1]) if ":" in host_port else 1883,
+        }
+        _LOGGER.info("HomGar login OK token=%s...", self._token[:10])
+        return self._iot_credentials
+
+    @property
+    def iot_credentials(self) -> dict | None:
+        return self._iot_credentials
+
+    def get_timer_devices(self) -> list[dict]:
+        """Return list of all HTV0540FRF timer sub-devices across all homes."""
+        homes = self._get(HOMGAR_HOMES_PATH) or []
+        timers = []
+        for home in homes:
+            hid = home.get("hid") or home.get("id")
+            if not hid:
+                continue
+            devices = self._get(HOMGAR_DEVICES_PATH, {"hid": hid}) or []
+            for hub in devices:
+                hub_mid = hub.get("mid")
+                hub_name = hub.get("name", "Unknown Hub")
+                for sub in hub.get("subDevices", []):
+                    if sub.get("model") != TIMER_MODEL:
+                        continue
+                    port_describe = sub.get("portDescribe", "")
+                    zone_names = [z.strip() for z in port_describe.split("|")] if port_describe else []
+                    port_count = sub.get("portNumber", 3)
+                    zones = []
+                    for i in range(1, port_count + 1):
+                        name = zone_names[i-1] if i-1 < len(zone_names) and zone_names[i-1] else f"Zone {i}"
+                        zones.append({"addr": i, "name": name})
+                    timers.append({
+                        "sid": sub.get("sid"), "mid": hub_mid, "addr": sub.get("addr"),
+                        "name": sub.get("name", "").strip(), "hub_name": hub_name,
+                        "zones": zones, "hid": hid,
+                    })
+        _LOGGER.info("HomGar: found %d timers", len(timers))
+        return timers
