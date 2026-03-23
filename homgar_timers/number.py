@@ -1,6 +1,9 @@
 """HomGar irrigation zone duration number entities."""
 import logging
+
 from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.config_entries import ConfigEntry
+
 from .const import DOMAIN, DEFAULT_DURATION_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
@@ -10,13 +13,34 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     if DOMAIN not in hass.data:
         return
     data = hass.data[DOMAIN]
+    entities = _build_entities(hass, data)
+    add_entities(entities, True)
+    _LOGGER.info("HomGar: added %d zone duration numbers", len(entities))
+
+
+async def async_setup_entry(hass, entry: ConfigEntry, async_add_entities):
+    if DOMAIN not in hass.data:
+        return
+    entities = _build_entities(hass, hass.data[DOMAIN])
+    async_add_entities(entities, True)
+    _LOGGER.info("HomGar: added %d zone duration numbers", len(entities))
+
+
+def _build_entities(hass, data):
     entities = []
     for timer in data["timers"]:
         for zone in timer["zones"]:
-            entities.append(HomGarZoneDuration(hass, timer["mid"], timer["addr"],
-                zone["addr"], timer["name"], zone["name"]))
-    add_entities(entities, True)
-    _LOGGER.info("HomGar: added %d zone duration numbers", len(entities))
+            entities.append(
+                HomGarZoneDuration(
+                    hass,
+                    timer["mid"],
+                    timer["addr"],
+                    zone["addr"],
+                    timer["name"],
+                    zone["name"],
+                )
+            )
+    return entities
 
 
 class HomGarZoneDuration(NumberEntity):

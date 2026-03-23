@@ -4,18 +4,23 @@
 set -e
 
 HA_HOST=${1:-tao-ha.tail03c0af.ts.net}
-DEST="root@${HA_HOST}:/homeassistant/custom_components/homgar_timers"
 SRC="$(dirname "$0")/homgar_timers"
 
 echo "=== Deploying HomGar Timers to ${HA_HOST} ==="
-ssh -o StrictHostKeyChecking=no root@${HA_HOST} "mkdir -p /homeassistant/custom_components/homgar_timers"
+ssh -o StrictHostKeyChecking=no root@${HA_HOST} \
+    "mkdir -p /homeassistant/custom_components/homgar_timers/translations"
 
-for f in __init__.py api.py mqtt.py switch.py number.py const.py manifest.json; do
+for f in __init__.py api.py config_flow.py mqtt.py switch.py number.py const.py manifest.json; do
     encoded=$(base64 < "${SRC}/${f}")
     ssh -o StrictHostKeyChecking=no root@${HA_HOST} \
         "echo '${encoded}' | base64 -d > /homeassistant/custom_components/homgar_timers/${f}"
     echo "  ✓ ${f}"
 done
+
+encoded=$(base64 < "${SRC}/translations/en.json")
+ssh -o StrictHostKeyChecking=no root@${HA_HOST} \
+    "echo '${encoded}' | base64 -d > /homeassistant/custom_components/homgar_timers/translations/en.json"
+echo "  ✓ translations/en.json"
 
 echo ""
 echo "Restarting HA..."

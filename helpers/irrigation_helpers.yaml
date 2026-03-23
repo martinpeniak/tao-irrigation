@@ -1,0 +1,9 @@
+input_boolean:
+  irrigation_auto_enabled:
+    name: Auto Irrigation Enabled
+    icon: mdi:sprinkler-variant
+
+input_button:
+  run_irrigation_now:
+    name: Run Irrigation Now
+    icon: mdi:play-circle

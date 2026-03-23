@@ -91,6 +91,10 @@ class HomGarApi:
         _LOGGER.info("HomGar login OK token=%s...", self._token[:10])
         return self._iot_credentials
 
+    def re_login(self) -> dict:
+        """Refresh the auth token and MQTT credentials."""
+        return self.login()
+
     @property
     def iot_credentials(self) -> dict | None:
         return self._iot_credentials
@@ -124,3 +128,32 @@ class HomGarApi:
                     })
         _LOGGER.info("HomGar: found %d timers", len(timers))
         return timers
+
+    def set_sub_device_param(self, sid: int, mid: int, param: str) -> bool:
+        """Send valve command via REST. Discovered endpoint: POST /app/device/sub/update.
+
+        Required fields: sid (sub-device ID), mid (hub device ID), param (D01 hex payload).
+        Returns True on code=0 SUCCESS.
+
+        Discovery note: MQTT publish to the user-level Alibaba IoT topic does NOT reach
+        the physical hub. This REST endpoint is the correct control path — it relays
+        commands server-side to the hub's device topic.
+        """
+        payload = json.dumps({"sid": sid, "mid": mid, "param": param}).encode()
+        req = urllib.request.Request(
+            HOMGAR_BASE_URL + "/app/device/sub/update",
+            data=payload,
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            data = json.loads(resp.read().decode())
+            if data.get("code") == 0:
+                _LOGGER.info("HomGar REST OK sid=%s mid=%s paramVer=%s",
+                             sid, mid, data.get("data", {}).get("paramVersion"))
+                return True
+            _LOGGER.error("HomGar REST failed sid=%s mid=%s: %s", sid, mid, data)
+            return False
+        except urllib.error.HTTPError as e:
+            raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")

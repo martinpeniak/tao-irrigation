@@ -6,5 +6,5 @@
   "dependencies": [],
   "codeowners": [],
   "iot_class": "cloud_push",
-  "config_flow": false
+  "config_flow": true
 }

@@ -18,9 +18,11 @@ CONF_PASSWORD = "password"
 CONF_AREA_CODE = "area_code"
 
 # D01 payload byte offsets (after stripping "11#" prefix and hex-decoding)
+# byte[2]:    observed sequence byte toggled when opening/closing a zone
 # byte[6]:    0x20 | zone_addr = zone running, 0x00 = all off
 # byte[24:28]: LE uint32 = stop unix timestamp (seconds)
 # byte[42:44]: LE uint16 = duration in seconds
+PAYLOAD_SEQUENCE_BYTE_OFFSET = 2
 ZONE_RUNNING_FLAG = 0x20
 ZONE_FLAG_BYTE_OFFSET = 6
 STOP_TS_BYTE_OFFSET = 24

@@ -1,7 +1,10 @@
 """HomGar irrigation zone switch entities."""
 import logging
+
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import callback
+
 from .const import DOMAIN, DEFAULT_DURATION_SECONDS
 from .mqtt import HomGarMQTTClient
 
@@ -12,21 +15,47 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     if DOMAIN not in hass.data:
         return
     data = hass.data[DOMAIN]
-    entities = []
-    for timer in data["timers"]:
-        for zone in timer["zones"]:
-            e = HomGarZoneSwitch(hass, timer["mid"], timer["addr"], zone["addr"],
-                                 timer["name"], zone["name"], data["mqtt"], data["state_store"])
-            entities.append(e)
+    entities = _build_entities(hass, data)
     data["switch_entities"] = entities
     add_entities(entities, True)
     _LOGGER.info("HomGar: added %d zone switches", len(entities))
 
 
+async def async_setup_entry(hass, entry: ConfigEntry, async_add_entities):
+    if DOMAIN not in hass.data:
+        return
+    data = hass.data[DOMAIN]
+    entities = _build_entities(hass, data)
+    data["switch_entities"] = entities
+    async_add_entities(entities, True)
+    _LOGGER.info("HomGar: added %d zone switches", len(entities))
+
+
+def _build_entities(hass, data):
+    entities = []
+    for timer in data["timers"]:
+        for zone in timer["zones"]:
+            entities.append(
+                HomGarZoneSwitch(
+                    hass,
+                    timer["mid"],
+                    timer.get("sid") or 0,
+                    timer["addr"],
+                    zone["addr"],
+                    timer["name"],
+                    zone["name"],
+                    data["mqtt"],
+                    data["state_store"],
+                )
+            )
+    return entities
+
+
 class HomGarZoneSwitch(SwitchEntity):
-    def __init__(self, hass, hub_mid, timer_addr, zone_addr,
+    def __init__(self, hass, hub_mid, sid, timer_addr, zone_addr,
                  timer_name, zone_name, mqtt_client: HomGarMQTTClient, state_store):
         self._hub_mid = hub_mid
+        self._sid = sid
         self._timer_addr = timer_addr
         self._zone_addr = zone_addr
         self._timer_name = timer_name
@@ -48,7 +77,7 @@ class HomGarZoneSwitch(SwitchEntity):
     @property
     def extra_state_attributes(self) -> dict:
         state = self._state_store.get(self._state_key, {})
-        return {"hub_mid": self._hub_mid, "timer_addr": self._timer_addr,
+        return {"hub_mid": self._hub_mid, "sid": self._sid, "timer_addr": self._timer_addr,
                 "zone_addr": self._zone_addr, "timer_name": self._timer_name,
                 "zone_name": self._zone_name, "duration_seconds": self._duration_seconds,
                 "active_zone": state.get("active_zone"), "stop_timestamp": state.get("stop_timestamp")}
@@ -58,13 +87,19 @@ class HomGarZoneSwitch(SwitchEntity):
 
     def turn_on(self, **kwargs):
         _LOGGER.info("Opening %s zone %d for %ds", self._timer_name, self._zone_addr, self._duration_seconds)
-        if self._mqtt.send_open(self._hub_mid, self._timer_addr, self._zone_addr, self._duration_seconds):
+        if self._mqtt.send_open(
+            self._hub_mid,
+            self._timer_addr,
+            self._zone_addr,
+            self._duration_seconds,
+            sid=self._sid,
+        ):
             self._is_on = True
             self.schedule_update_ha_state()
 
     def turn_off(self, **kwargs):
         _LOGGER.info("Closing %s zone %d", self._timer_name, self._zone_addr)
-        if self._mqtt.send_close(self._hub_mid, self._timer_addr):
+        if self._mqtt.send_close(self._hub_mid, self._timer_addr, sid=self._sid):
             self._is_on = False
             self.schedule_update_ha_state()
 

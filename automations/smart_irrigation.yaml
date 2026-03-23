@@ -1,0 +1,162 @@
+- id: smart_irrigation_daily
+  alias: Smart Irrigation
+  description: Run irrigation zones when solar, battery, well, pump, and weather conditions are safe.
+  mode: single
+  trigger:
+    - platform: time
+      at: "07:00:00"
+    - platform: state
+      entity_id: input_button.run_irrigation_now
+  variables:
+    bad_weather_states:
+      - rainy
+      - pouring
+      - lightning
+      - lightning-rainy
+    zone_plan:
+      - label: Oliver's Orchard - First Year Trees
+        switch: switch.irrigation_olivers_orchard_first_year_trees
+        duration_entity: number.irrigation_olivers_orchard_first_year_trees_duration
+      - label: Oliver's Orchard - Zone 2
+        switch: switch.irrigation_olivers_orchard_olivers_orchard_2
+        duration_entity: number.irrigation_olivers_orchard_olivers_orchard_2_duration
+      - label: Oliver's Orchard - Nebulizer
+        switch: switch.irrigation_olivers_orchard_nebulizer
+        duration_entity: number.irrigation_olivers_orchard_nebulizer_duration
+      - label: House Garden -3 - Oliver's Walk
+        switch: switch.irrigation_house_garden_3_olivers_walk
+        duration_entity: number.irrigation_house_garden_3_olivers_walk_duration
+      - label: House Garden -3 - Buddha Garden
+        switch: switch.irrigation_house_garden_3_buddha_garden
+        duration_entity: number.irrigation_house_garden_3_buddha_garden_duration
+      - label: House Garden -3 - Papaya 40
+        switch: switch.irrigation_house_garden_3_papaya_40
+        duration_entity: number.irrigation_house_garden_3_papaya_40_duration
+      - label: House Garden -2 - Entrance Garden
+        switch: switch.irrigation_house_garden_2_entrance_garden
+        duration_entity: number.irrigation_house_garden_2_entrance_garden_duration
+      - label: House Garden -2 - Dome Side
+        switch: switch.irrigation_house_garden_2_dome_side
+        duration_entity: number.irrigation_house_garden_2_dome_side_duration
+      - label: House Garden -2 - Shower Side
+        switch: switch.irrigation_house_garden_2_shower_side
+        duration_entity: number.irrigation_house_garden_2_shower_side_duration
+      - label: Oasis - Frontyard Garden
+        switch: switch.irrigation_oasis_frontyard_garden
+        duration_entity: number.irrigation_oasis_frontyard_garden_duration
+      - label: Oasis - Nebulizer
+        switch: switch.irrigation_oasis_nebulizer
+        duration_entity: number.irrigation_oasis_nebulizer_duration
+      - label: Oasis - Zone 3
+        switch: switch.irrigation_oasis_zone_3
+        duration_entity: number.irrigation_oasis_zone_3_duration
+    failure_summary: >-
+      {% set failures = [] %}
+      {% if not is_state('input_boolean.irrigation_auto_enabled', 'on') %}
+        {% set failures = failures + ['auto irrigation is disabled'] %}
+      {% endif %}
+      {% if states('sensor.luxpower_sna_pv_power_3') | float(0) <= 300 %}
+        {% set failures = failures + ['gardens solar is ' ~ states('sensor.luxpower_sna_pv_power_3') ~ ' W (needs > 300 W)'] %}
+      {% endif %}
+      {% if states('sensor.luxpower_sna_battery_state_of_charge_2') | float(0) <= 50 %}
+        {% set failures = failures + ['gardens battery SOC is ' ~ states('sensor.luxpower_sna_battery_state_of_charge_2') ~ '% (needs > 50%)'] %}
+      {% endif %}
+      {% if states('sensor.well_depth') | float(0) <= 0.5 %}
+        {% set failures = failures + ['well depth is ' ~ states('sensor.well_depth') ~ ' m (needs > 0.5 m)'] %}
+      {% endif %}
+      {% if states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') | float(0) >= 100 %}
+        {% set failures = failures + ['pump draw is ' ~ states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') ~ ' W (needs < 100 W)'] %}
+      {% endif %}
+      {% if states('weather.forecast_home') in bad_weather_states %}
+        {% set failures = failures + ['weather is ' ~ states('weather.forecast_home')] %}
+      {% endif %}
+      {{ failures | join('; ') if failures else 'All conditions passed' }}
+    conditions_summary: >-
+      Auto={{ states('input_boolean.irrigation_auto_enabled') }},
+      Solar={{ states('sensor.luxpower_sna_pv_power_3') }} W,
+      Battery={{ states('sensor.luxpower_sna_battery_state_of_charge_2') }}%,
+      Well={{ states('sensor.well_depth') }} m,
+      Pump={{ states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') }} W,
+      Weather={{ states('weather.forecast_home') }}
+    total_run_minutes: >-
+      {% set ns = namespace(total=0) %}
+      {% for zone in zone_plan %}
+        {% set ns.total = ns.total + (states(zone.duration_entity) | int(0)) %}
+      {% endfor %}
+      {{ ns.total }}
+    zones_to_run_summary: >-
+      {% set ns = namespace(zones=[]) %}
+      {% for zone in zone_plan %}
+        {% set minutes = states(zone.duration_entity) | int(0) %}
+        {% if minutes > 0 %}
+          {% set ns.zones = ns.zones + [zone.label ~ ' (' ~ minutes ~ ' min)'] %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.zones | join(', ') if ns.zones else 'None' }}
+  action:
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: input_boolean.irrigation_auto_enabled
+              state: "on"
+            - condition: numeric_state
+              entity_id: sensor.luxpower_sna_pv_power_3
+              above: 300
+            - condition: numeric_state
+              entity_id: sensor.luxpower_sna_battery_state_of_charge_2
+              above: 50
+            - condition: numeric_state
+              entity_id: sensor.well_depth
+              above: 0.5
+            - condition: numeric_state
+              entity_id: sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power
+              below: 100
+            - condition: template
+              value_template: "{{ states('weather.forecast_home') not in bad_weather_states }}"
+          sequence:
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ total_run_minutes | int(0) == 0 }}"
+                  sequence:
+                    - service: persistent_notification.create
+                      data:
+                        title: Smart irrigation skipped
+                        message: >-
+                          All safety conditions passed, but no irrigation zones have a duration above 0 minutes.
+                          Conditions: {{ conditions_summary }}
+              default:
+                - repeat:
+                    for_each: "{{ zone_plan }}"
+                    sequence:
+                      - variables:
+                          duration_minutes: "{{ states(repeat.item.duration_entity) | int(0) }}"
+                      - choose:
+                          - conditions:
+                              - condition: template
+                                value_template: "{{ duration_minutes > 0 }}"
+                            sequence:
+                              - service: switch.turn_on
+                                target:
+                                  entity_id: "{{ repeat.item.switch }}"
+                              - delay:
+                                  seconds: "{{ duration_minutes * 60 }}"
+                              - service: switch.turn_off
+                                target:
+                                  entity_id: "{{ repeat.item.switch }}"
+                              - delay:
+                                  seconds: 30
+                - service: persistent_notification.create
+                  data:
+                    title: Smart irrigation complete
+                    message: >-
+                      Zones run: {{ zones_to_run_summary }}.
+                      Total water time: {{ total_run_minutes | int(0) }} minutes.
+                      Conditions: {{ conditions_summary }}
+      default:
+        - service: persistent_notification.create
+          data:
+            title: Smart irrigation blocked
+            message: >-
+              Irrigation did not run because these checks failed: {{ failure_summary }}.
+              Conditions: {{ conditions_summary }}

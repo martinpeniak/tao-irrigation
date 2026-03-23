@@ -7,25 +7,84 @@ configuration.yaml:
       area_code: 34              # Spain=34, UK=44, US=1
 """
 import logging
+from typing import Any
+
+import voluptuous as vol
+import homeassistant.helpers.config_validation as cv
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import discovery
+
 from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_AREA_CODE
 from .api import HomGarApi, HomGarApiError
 from .mqtt import HomGarMQTTClient
 
 _LOGGER = logging.getLogger(__name__)
+PLATFORMS = [Platform.SWITCH, Platform.NUMBER]
+
+CONFIG_SCHEMA = vol.Schema({
+    DOMAIN: vol.Schema({
+        vol.Required(CONF_EMAIL): cv.string,
+        vol.Required(CONF_PASSWORD): cv.string,
+        vol.Optional(CONF_AREA_CODE, default="34"): cv.string,
+    })
+}, extra=vol.ALLOW_EXTRA)
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     if DOMAIN not in config:
         return True
     conf = config[DOMAIN]
-    return await _setup(hass, conf[CONF_EMAIL], conf[CONF_PASSWORD],
-                        str(conf.get(CONF_AREA_CODE, "34")), config)
+    return await _setup_runtime(
+        hass,
+        conf[CONF_EMAIL],
+        conf[CONF_PASSWORD],
+        str(conf.get(CONF_AREA_CODE, "34")),
+        source="yaml",
+        discovery_config=config,
+    )
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    return await _setup_runtime(
+        hass,
+        entry.data[CONF_EMAIL],
+        entry.data[CONF_PASSWORD],
+        str(entry.data.get(CONF_AREA_CODE, "34")),
+        source="config_entry",
+        entry=entry,
+    )
 
 
-async def _setup(hass, email, password, area_code, config) -> bool:
-    hass.data.setdefault(DOMAIN, {})
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok and DOMAIN in hass.data:
+        mqtt_client = hass.data[DOMAIN].get("mqtt")
+        if mqtt_client:
+            await hass.async_add_executor_job(mqtt_client.disconnect)
+        hass.data.pop(DOMAIN, None)
+    return unload_ok
+
+
+async def _setup_runtime(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
+    area_code: str,
+    *,
+    source: str,
+    discovery_config: dict[str, Any] | None = None,
+    entry: ConfigEntry | None = None,
+) -> bool:
+    existing = hass.data.get(DOMAIN)
+    if existing and existing.get("mqtt"):
+        _LOGGER.error(
+            "HomGar already configured via %s; remove duplicate %s setup",
+            existing.get("setup_source", "unknown"),
+            source,
+        )
+        return False
+
     api = HomGarApi(email, password, area_code)
     try:
         iot_creds = await hass.async_add_executor_job(api.login)
@@ -49,12 +108,21 @@ async def _setup(hass, email, password, area_code, config) -> bool:
         state_store[store_key] = decoded
         hass.bus.fire(f"{DOMAIN}_state_update", {"key": store_key, "state": decoded})
 
-    mqtt_client = HomGarMQTTClient(iot_creds, on_state_update)
+    mqtt_client = HomGarMQTTClient(api, iot_creds, on_state_update)
+    mqtt_client.set_rest_client(api)  # REST client for valve commands via /app/device/sub/update
     connected = await hass.async_add_executor_job(mqtt_client.connect)
     if not connected:
         _LOGGER.warning("HomGar MQTT connection failed — controls will optimistically update")
-    hass.data[DOMAIN] = {"timers": timers, "mqtt": mqtt_client,
-                         "state_store": state_store, "switch_entities": []}
-    await discovery.async_load_platform(hass, "switch", DOMAIN, {}, config)
-    await discovery.async_load_platform(hass, "number", DOMAIN, {}, config)
+    hass.data[DOMAIN] = {
+        "timers": timers,
+        "mqtt": mqtt_client,
+        "state_store": state_store,
+        "switch_entities": [],
+        "setup_source": source,
+    }
+    if entry:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    else:
+        await discovery.async_load_platform(hass, "switch", DOMAIN, {}, discovery_config or {})
+        await discovery.async_load_platform(hass, "number", DOMAIN, {}, discovery_config or {})
     return True

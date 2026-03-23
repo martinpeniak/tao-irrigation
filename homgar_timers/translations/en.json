@@ -1,0 +1,24 @@
+{
+  "title": "HomGar Irrigation Timers",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to HomGar",
+        "description": "Enter the HomGar account used for your irrigation timers.",
+        "data": {
+          "email": "Email",
+          "password": "Password",
+          "area_code": "Area code"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to HomGar. Check your credentials and network access.",
+      "no_timers_found": "The account connected, but no supported HTV0540FRF timers were found.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This HomGar account is already configured."
+    }
+  }
+}
