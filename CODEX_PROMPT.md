@@ -22,36 +22,79 @@ Component path on HA: `/homeassistant/custom_components/homgar_timers/`
 
 ## What is broken
 
-### Bug 1 — Runaway valve (CRITICAL)
+### THE CORE PROBLEM — On/Off control does not work reliably
 
-**Symptom:** Turning on a zone then off does not stop it. Valve keeps running.
-Turning off from dashboard re-enables itself moments later.
+**Expected behaviour:** Tap zone ON in HA → valve opens within ~60s. Tap OFF → valve closes within ~60s.
 
-**Root cause:** The retry loop in `switch.py` (`turn_on` spawns a background thread
-that re-sends the open command every 20s for up to 4 minutes). When `turn_off` is
-called, it stops the retry thread and sends one close command. But the hub may have
-already queued multiple open commands from earlier retries. Each queued open
-command runs for its full duration independently. The hub runs them sequentially.
+**Actual behaviour:**
+- Tapping ON sometimes works (valve opens after 20-90s delay) but sometimes doesn't
+- Tapping OFF does NOT stop the valve. The valve keeps running for the full duration.
+- After tapping OFF, the HA tile shows the zone as ON again moments later (entity reverts)
+- The valve ran for 37 minutes uncontrolled during testing despite repeated OFF attempts
 
-**Fix needed:**
-- `turn_off` must send the close command aggressively — keep re-sending close
-  every 20s (same retry logic) until hub confirms ALL OFF via MQTT
-- Or: remove the retry loop entirely and just send once. The hub IS picking
-  up commands within 20-90s without retrying. The retry loop caused the runaway.
-- Recommended approach: **remove retry loop**, send open once, rely on hub polling.
-  The hub polls every ~30-90 seconds. This is acceptable for irrigation.
+**Root cause — the retry loop:**
 
-### Bug 2 — Turn off doesn't physically close valve
+`turn_on` in `switch.py` spawns a background thread that re-sends the open command
+every 20 seconds for up to 4 minutes (12 retries × 20s). This was added to compensate
+for the hub's slow poll cycle. It caused a catastrophic failure:
 
-**Symptom:** Turning off from HA dashboard sends close command (REST returns SUCCESS)
-but the valve stays open.
+1. User taps ON → 1 open command sent immediately
+2. Retry thread sends open again at +20s, +40s, +60s, +80s... (up to 12 times)
+3. User taps OFF → retry thread stops, 1 close command sent
+4. But the hub has already queued 4-6 open commands from the retry loop
+5. Hub executes each queued open command sequentially, each for the full duration
+6. Close command arrives but hub ignores it — it's already mid-execution of a queue
+7. Valve runs for (number_of_queued_opens × duration) minutes uncontrolled
 
-**Root cause:** Same as Bug 1 — the retry loop had already queued multiple opens.
-Once the retry loop is removed, a single close command should work.
+**The fix — remove the retry loop entirely:**
 
-**Also check:** The hub executes commands in FIFO order. If 6 open commands were
-queued (retry loop ran 6 times before turn_off), the hub will run all 6 regardless
-of the close command arriving. The close command only affects the NEXT poll.
+The hub DOES pick up a single command within 20-90 seconds on its own poll cycle.
+No retrying is needed. One send is sufficient.
+
+```python
+def turn_on(self, **kwargs):
+    _LOGGER.warning("HomGar OPEN %s zone %d for %ds",
+                    self._timer_name, self._zone_addr, self._duration_seconds)
+    self._mqtt.send_open(self._hub_mid, self._timer_addr,
+                         self._zone_addr, self._duration_seconds, sid=self._sid)
+    self._is_on = True
+    self.schedule_update_ha_state()
+
+def turn_off(self, **kwargs):
+    _LOGGER.warning("HomGar CLOSE %s zone %d",
+                    self._timer_name, self._zone_addr)
+    self._mqtt.send_close(self._hub_mid, self._timer_addr, sid=self._sid)
+    self._is_on = False
+    self.schedule_update_ha_state()
+```
+
+Remove entirely: `_retry_thread`, `_retry_stop`, `_stop_retry()`,
+`RETRY_INTERVAL`, `RETRY_MAX`, and `import threading`.
+
+**After this fix:** Turn on → hub picks up within 60s → valve opens.
+Turn off → hub picks up within 60s → valve closes. No runaway. No queue buildup.
+The 20-90s delay is acceptable for irrigation — this is not a light switch.
+
+**IMPORTANT — Emergency close script:**
+While this fix is being deployed, if a valve gets stuck open, run:
+```bash
+python3 emergency_close.py
+```
+This sends close commands directly to all 4 hubs via REST, bypassing HA entirely.
+
+### Bug 2 — HA entity shows OFF while valve is physically running
+
+**Symptom:** HA tile shows zone as OFF even though the physical valve is open
+(water is flowing). Or shows ON even though valve is closed.
+
+**Root cause:** The HA entity state is set optimistically in `turn_on`/`turn_off`
+and only updated when an MQTT state update arrives from the hub. If the MQTT
+connection is disrupted (e.g., user logged in via HomGar app, causing rc=7 kick),
+state updates are missed and the entity shows stale state.
+
+**Fix:** The `async_added_to_hass` listener is already wired correctly to update
+state from MQTT. Just make sure the MQTT reconnect logic works. No code change
+needed beyond the retry loop removal.
 
 ### Bug 3 — Duration number entity doesn't propagate to switch on HA restart
 
