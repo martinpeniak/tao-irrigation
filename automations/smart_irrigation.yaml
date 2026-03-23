@@ -1,6 +1,6 @@
 - id: smart_irrigation_daily
   alias: Smart Irrigation
-  description: Run irrigation zones when solar, battery, well, pump, and weather conditions are safe.
+  description: Run irrigation zones one at a time when solar, battery, well, and weather conditions are safe.
   mode: single
   trigger:
     - platform: time
@@ -11,8 +11,6 @@
     bad_weather_states:
       - rainy
       - pouring
-      - lightning
-      - lightning-rainy
     zone_plan:
       - label: Oliver's Orchard - First Year Trees
         switch: switch.irrigation_olivers_orchard_first_year_trees
@@ -52,9 +50,6 @@
         duration_entity: number.irrigation_oasis_zone_3_duration
     failure_summary: >-
       {% set failures = [] %}
-      {% if not is_state('input_boolean.irrigation_auto_enabled', 'on') %}
-        {% set failures = failures + ['auto irrigation is disabled'] %}
-      {% endif %}
       {% if states('sensor.luxpower_sna_pv_power_3') | float(0) <= 300 %}
         {% set failures = failures + ['gardens solar is ' ~ states('sensor.luxpower_sna_pv_power_3') ~ ' W (needs > 300 W)'] %}
       {% endif %}
@@ -64,19 +59,14 @@
       {% if states('sensor.well_depth') | float(0) <= 0.5 %}
         {% set failures = failures + ['well depth is ' ~ states('sensor.well_depth') ~ ' m (needs > 0.5 m)'] %}
       {% endif %}
-      {% if states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') | float(0) >= 100 %}
-        {% set failures = failures + ['pump draw is ' ~ states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') ~ ' W (needs < 100 W)'] %}
-      {% endif %}
       {% if states('weather.forecast_home') in bad_weather_states %}
         {% set failures = failures + ['weather is ' ~ states('weather.forecast_home')] %}
       {% endif %}
       {{ failures | join('; ') if failures else 'All conditions passed' }}
     conditions_summary: >-
-      Auto={{ states('input_boolean.irrigation_auto_enabled') }},
       Solar={{ states('sensor.luxpower_sna_pv_power_3') }} W,
       Battery={{ states('sensor.luxpower_sna_battery_state_of_charge_2') }}%,
       Well={{ states('sensor.well_depth') }} m,
-      Pump={{ states('sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power') }} W,
       Weather={{ states('weather.forecast_home') }}
     total_run_minutes: >-
       {% set ns = namespace(total=0) %}
@@ -96,9 +86,6 @@
   action:
     - choose:
         - conditions:
-            - condition: state
-              entity_id: input_boolean.irrigation_auto_enabled
-              state: "on"
             - condition: numeric_state
               entity_id: sensor.luxpower_sna_pv_power_3
               above: 300
@@ -108,9 +95,6 @@
             - condition: numeric_state
               entity_id: sensor.well_depth
               above: 0.5
-            - condition: numeric_state
-              entity_id: sensor.smart_switch_23070736089517510d0248e1e9cfcfd7_power
-              below: 100
             - condition: template
               value_template: "{{ states('weather.forecast_home') not in bad_weather_states }}"
           sequence:

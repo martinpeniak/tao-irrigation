@@ -1,13 +1,15 @@
-"""Tests for HomGar MQTT D01 payload encoding and decoding."""
+"""Tests for the HomGar D01 payload codec."""
 from __future__ import annotations
 
 import importlib.util
+import struct
 import sys
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 BASELINE = "11#17E1BE0019D8001AD8001BD8001D201E201F2018DC0121B70000000022B70000000023B70000000025AD000026AD000027AD0000"
-ZONE1_ON = "11#17E1BF0019D8211AD8001BD8001D201E201F2018DC0121B77029EE1822B70000000023B70000000025AD580226AD000027AD0000"
+APP_OPEN = "11#17E1BE0019D8211AD8001BD8001D201E201F2018DC0121B725BAEE1822B70000000023B70000000025AD3C0026AD000027AD0000"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_ROOT = REPO_ROOT / "homgar_timers"
@@ -30,18 +32,18 @@ def _load_module(module_name: str, relative_path: str):
     return module
 
 
-_load_module("const", "const.py")
+const = _load_module("const", "const.py")
 mqtt = _load_module("mqtt", "mqtt.py")
 
 
 def test_decode_d01_reports_active_zone():
-    decoded = mqtt.decode_d01(ZONE1_ON)
+    decoded = mqtt.decode_d01(APP_OPEN)
     assert decoded["active_zone"] == 1
 
 
 def test_decode_d01_reports_duration_seconds():
-    decoded = mqtt.decode_d01(ZONE1_ON)
-    assert decoded["duration_seconds"] == 600
+    decoded = mqtt.decode_d01(APP_OPEN)
+    assert decoded["duration_seconds"] == 60
 
 
 def test_decode_d01_reports_no_active_zone_for_baseline():
@@ -49,22 +51,28 @@ def test_decode_d01_reports_no_active_zone_for_baseline():
     assert decoded["active_zone"] is None
 
 
-def test_build_open_command_sets_zone_flag_and_duration():
-    command = mqtt.build_open_command(BASELINE, zone_addr=1, duration_seconds=600)
+def test_build_open_command_uses_homgar_epoch_stop_timestamp():
+    expected_stop = struct.unpack_from("<I", bytes.fromhex(APP_OPEN.split("#", 1)[1]), 24)[0]
+    capture_unix_time = const.HOMGAR_EPOCH_OFFSET + expected_stop - 60
+
+    with patch.object(mqtt.time, "time", return_value=capture_unix_time):
+        command = mqtt.build_open_command(BASELINE, zone_addr=1, duration_seconds=60)
+
     raw = bytes.fromhex(command.split("#", 1)[1])
     assert raw[6] == 0x21
-    assert raw[42:44] == bytes.fromhex("5802")
+    assert raw[42] == 0x3C
+    assert struct.unpack_from("<I", raw, 24)[0] == expected_stop
 
 
-def test_build_close_command_resets_zone_flag_and_duration():
-    """Close command should clear zone flag, stop timestamp and duration.
-
-    Note: does NOT check exact byte equality with BASELINE because the sequence
-    byte (byte[2]) is decremented by build_close_command to match the hub's
-    expected sequence counter, so the payload differs from the original baseline.
-    """
-    command = mqtt.build_close_command(ZONE1_ON)
+def test_build_close_command_zeros_runtime_fields():
+    command = mqtt.build_close_command(APP_OPEN)
     raw = bytes.fromhex(command.split("#", 1)[1])
-    assert raw[6] == 0x00, "zone flag should be cleared"
-    assert raw[42:44] == b'\x00\x00', "duration should be zeroed"
-    assert raw[24:28] == b'\x00\x00\x00\x00', "stop timestamp should be zeroed"
+    assert raw[6] == 0x00
+    assert raw[24:28] == b"\x00\x00\x00\x00"
+    assert raw[42:44] == b"\x00\x00"
+
+
+def test_homgar_now_matches_capture_epoch():
+    expected_stop = struct.unpack_from("<I", bytes.fromhex(APP_OPEN.split("#", 1)[1]), 24)[0]
+    capture_unix_time = const.HOMGAR_EPOCH_OFFSET + expected_stop - 60
+    assert mqtt.homgar_now(capture_unix_time) + 60 == expected_stop

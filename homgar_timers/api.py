@@ -7,6 +7,8 @@ Authentication (reverse-engineered from homgar_api.py v0.2.9):
   - Headers:   Content-Type: application/json, lang: en, appCode: 1
   - Auth token used in subsequent requests as "auth" header (not Authorization)
 """
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -16,10 +18,30 @@ from typing import Any
 
 from .const import (
     HOMGAR_BASE_URL, HOMGAR_LOGIN_PATH,
-    HOMGAR_HOMES_PATH, HOMGAR_DEVICES_PATH, TIMER_MODEL,
+    HOMGAR_HOMES_PATH, HOMGAR_DEVICES_PATH, HOMGAR_DEVICE_STATUS_PATH, TIMER_MODEL,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _extract_d_payloads(value: Any, found: dict[str, str] | None = None) -> dict[str, str]:
+    if found is None:
+        found = {}
+    if isinstance(value, dict):
+        item_id = value.get("id")
+        item_value = value.get("value")
+        if isinstance(item_id, str) and item_id.startswith("D") and "#" in str(item_value):
+            found[item_id] = str(item_value)
+        for key, item in value.items():
+            if isinstance(key, str) and key.startswith("D"):
+                raw_val = item.get("value", "") if isinstance(item, dict) else item
+                if "#" in str(raw_val):
+                    found[key] = str(raw_val)
+            _extract_d_payloads(item, found)
+    elif isinstance(value, list):
+        for item in value:
+            _extract_d_payloads(item, found)
+    return found
 
 
 class HomGarApiError(Exception):
@@ -44,15 +66,41 @@ class HomGarApi:
         url = HOMGAR_BASE_URL + path
         if params:
             url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-        req = urllib.request.Request(url, headers=self._headers())
-        try:
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read().decode())
-            if data.get("code") != 0:
-                raise HomGarApiError(f"API error: {data}")
-            return data.get("data")
-        except urllib.error.HTTPError as e:
-            raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
+        for attempt in range(2):
+            req = urllib.request.Request(url, headers=self._headers())
+            try:
+                resp = urllib.request.urlopen(req, timeout=15)
+                data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
+            if data.get("code") == 0:
+                return data.get("data")
+            if data.get("code") == 1004 and attempt == 0:
+                _LOGGER.warning("HomGar token expired during GET %s; refreshing login", path)
+                self.re_login()
+                continue
+            raise HomGarApiError(f"API error: {data}")
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode()
+        for attempt in range(2):
+            req = urllib.request.Request(
+                HOMGAR_BASE_URL + path,
+                data=body,
+                headers=self._headers(),
+                method="POST",
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=15)
+                data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
+            if data.get("code") == 1004 and attempt == 0:
+                _LOGGER.warning("HomGar token expired during POST %s; refreshing login", path)
+                self.re_login()
+                continue
+            return data
+        raise HomGarApiError(f"POST failed after retry: {path}")
 
 
     def login(self) -> dict:
@@ -124,10 +172,20 @@ class HomGarApi:
                     timers.append({
                         "sid": sub.get("sid"), "mid": hub_mid, "addr": sub.get("addr"),
                         "name": sub.get("name", "").strip(), "hub_name": hub_name,
+                        "hub_product_key": hub.get("productKey", ""),
+                        "hub_device_name": hub.get("deviceName", ""),
                         "zones": zones, "hid": hid,
                     })
         _LOGGER.info("HomGar: found %d timers", len(timers))
         return timers
+
+    def get_device_status(self, mid: int) -> Any:
+        """Return raw device status for a hub."""
+        return self._get(HOMGAR_DEVICE_STATUS_PATH, {"mid": mid}) or {}
+
+    def get_current_payloads(self, mid: int) -> dict[str, str]:
+        """Extract current Dxx payloads from the hub status response."""
+        return _extract_d_payloads(self.get_device_status(mid))
 
     def set_sub_device_param(self, sid: int, mid: int, param: str) -> bool:
         """Send valve command via REST. Discovered endpoint: POST /app/device/sub/update.
@@ -139,21 +197,64 @@ class HomGarApi:
         the physical hub. This REST endpoint is the correct control path — it relays
         commands server-side to the hub's device topic.
         """
-        payload = json.dumps({"sid": sid, "mid": mid, "param": param}).encode()
-        req = urllib.request.Request(
-            HOMGAR_BASE_URL + "/app/device/sub/update",
-            data=payload,
-            headers=self._headers(),
-            method="POST",
+        data = self._post("/app/device/sub/update", {"sid": sid, "mid": mid, "param": param})
+        if data.get("code") == 0:
+            _LOGGER.info("HomGar REST OK sid=%s mid=%s paramVer=%s",
+                         sid, mid, data.get("data", {}).get("paramVersion"))
+            return True
+        _LOGGER.error("HomGar REST failed sid=%s mid=%s: %s", sid, mid, data)
+        return False
+
+    def control_work_mode(
+        self,
+        *,
+        mid: int,
+        product_key: str,
+        device_name: str,
+        mode: int,
+        addr: int,
+        port: int,
+        param: str = "",
+        duration: int = 0,
+    ) -> str | None:
+        """Control a gateway sub-device via /app/device/controlWorkMode.
+
+        Live behavior on TAO:
+          - Open: mode=1, addr=<timer_addr>, port=<zone_addr>, param=<Dxx payload>, duration=<seconds>
+          - Close: mode=0, addr=<timer_addr>, port=<zone_addr>, param="", duration=0
+          - Response code 0 = open accepted, code 4 = close accepted
+        """
+        data = self._post(
+            "/app/device/controlWorkMode",
+            {
+                "mid": mid,
+                "productKey": product_key,
+                "deviceName": device_name,
+                "mode": mode,
+                "addr": addr,
+                "port": port,
+                "param": param,
+                "duration": duration,
+            },
         )
-        try:
-            resp = urllib.request.urlopen(req, timeout=15)
-            data = json.loads(resp.read().decode())
-            if data.get("code") == 0:
-                _LOGGER.info("HomGar REST OK sid=%s mid=%s paramVer=%s",
-                             sid, mid, data.get("data", {}).get("paramVersion"))
-                return True
-            _LOGGER.error("HomGar REST failed sid=%s mid=%s: %s", sid, mid, data)
-            return False
-        except urllib.error.HTTPError as e:
-            raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
+        code = data.get("code")
+        if code in (0, 4):
+            state = data.get("data", {}).get("state")
+            _LOGGER.info(
+                "HomGar controlWorkMode OK mid=%s mode=%s addr=%s port=%s code=%s",
+                mid,
+                mode,
+                addr,
+                port,
+                code,
+            )
+            return state if isinstance(state, str) and "#" in state else None
+        _LOGGER.error(
+            "HomGar controlWorkMode failed mid=%s mode=%s addr=%s port=%s: %s",
+            mid,
+            mode,
+            addr,
+            port,
+            data,
+        )
+        return None

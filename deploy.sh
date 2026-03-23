@@ -26,10 +26,10 @@ echo ""
 echo "Restarting HA..."
 ssh -o StrictHostKeyChecking=no root@${HA_HOST} 'ha core restart'
 
-echo "Waiting 25s for restart..."
-sleep 25
+echo "Waiting 35s for restart..."
+sleep 35
 
 echo ""
 echo "=== HomGar log output ==="
 ssh -o StrictHostKeyChecking=no root@${HA_HOST} \
-    'ha core logs 2>/dev/null | grep -i "homgar" | tail -20'
+    'ha core logs 2>/dev/null | grep -i "homgar" | tail -15'

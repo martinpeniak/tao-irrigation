@@ -44,6 +44,8 @@ def _build_entities(hass, data):
                     zone["addr"],
                     timer["name"],
                     zone["name"],
+                    timer.get("hub_product_key", ""),
+                    timer.get("hub_device_name", ""),
                     data["mqtt"],
                     data["state_store"],
                 )
@@ -52,14 +54,28 @@ def _build_entities(hass, data):
 
 
 class HomGarZoneSwitch(SwitchEntity):
-    def __init__(self, hass, hub_mid, sid, timer_addr, zone_addr,
-                 timer_name, zone_name, mqtt_client: HomGarMQTTClient, state_store):
+    def __init__(
+        self,
+        hass,
+        hub_mid,
+        sid,
+        timer_addr,
+        zone_addr,
+        timer_name,
+        zone_name,
+        hub_product_key,
+        hub_device_name,
+        mqtt_client: HomGarMQTTClient,
+        state_store,
+    ):
         self._hub_mid = hub_mid
         self._sid = sid
         self._timer_addr = timer_addr
         self._zone_addr = zone_addr
         self._timer_name = timer_name
         self._zone_name = zone_name
+        self._hub_product_key = hub_product_key
+        self._hub_device_name = hub_device_name
         self._mqtt = mqtt_client
         self._state_store = state_store
         self._is_on = False
@@ -86,20 +102,29 @@ class HomGarZoneSwitch(SwitchEntity):
         self._duration_seconds = seconds
 
     def turn_on(self, **kwargs):
-        _LOGGER.info("Opening %s zone %d for %ds", self._timer_name, self._zone_addr, self._duration_seconds)
+        _LOGGER.warning("HomGar OPEN %s zone %d for %ds", self._timer_name, self._zone_addr, self._duration_seconds)
         if self._mqtt.send_open(
             self._hub_mid,
             self._timer_addr,
             self._zone_addr,
             self._duration_seconds,
+            product_key=self._hub_product_key,
+            device_name=self._hub_device_name,
             sid=self._sid,
         ):
             self._is_on = True
             self.schedule_update_ha_state()
 
     def turn_off(self, **kwargs):
-        _LOGGER.info("Closing %s zone %d", self._timer_name, self._zone_addr)
-        if self._mqtt.send_close(self._hub_mid, self._timer_addr, sid=self._sid):
+        _LOGGER.warning("HomGar CLOSE %s zone %d", self._timer_name, self._zone_addr)
+        if self._mqtt.send_close(
+            self._hub_mid,
+            self._timer_addr,
+            self._zone_addr,
+            product_key=self._hub_product_key,
+            device_name=self._hub_device_name,
+            sid=self._sid,
+        ):
             self._is_on = False
             self.schedule_update_ha_state()
 

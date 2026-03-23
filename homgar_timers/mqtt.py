@@ -16,6 +16,8 @@ D01 hex payload (after "11#" prefix):
   byte[24:28]: LE uint32 stop timestamp
   byte[42:44]: LE uint16 duration seconds
 """
+from __future__ import annotations
+
 import hashlib, hmac, json, logging, struct, threading, time
 from typing import Callable
 
@@ -27,10 +29,10 @@ except ImportError:
 
 from .const import (
     DURATION_BYTE_OFFSET,
-    PAYLOAD_SEQUENCE_BYTE_OFFSET,
+    HOMGAR_EPOCH_OFFSET,
     STOP_TS_BYTE_OFFSET,
     ZONE_FLAG_BYTE_OFFSET,
-    ZONE_RUNNING_FLAG,
+    ZONE_RUNNING_FLAGS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -54,12 +56,17 @@ def decode_d01(hex_payload: str) -> dict:
     result = {"raw": hex_payload}
     if len(b) > ZONE_FLAG_BYTE_OFFSET:
         flag = b[ZONE_FLAG_BYTE_OFFSET]
-        result["active_zone"] = (flag & 0x0F) if (flag & ZONE_RUNNING_FLAG) else None
+        result["active_zone"] = (flag & 0x0F) if any(flag & running_flag for running_flag in ZONE_RUNNING_FLAGS) else None
     if len(b) >= DURATION_BYTE_OFFSET + 2:
         result["duration_seconds"] = struct.unpack_from("<H", b, DURATION_BYTE_OFFSET)[0]
     if len(b) >= STOP_TS_BYTE_OFFSET + 4:
         result["stop_timestamp"] = struct.unpack_from("<I", b, STOP_TS_BYTE_OFFSET)[0]
     return result
+
+
+def homgar_now(unix_time: int | None = None) -> int:
+    """Return the current HomGar-epoch timestamp in seconds."""
+    return int(time.time() if unix_time is None else unix_time) - HOMGAR_EPOCH_OFFSET
 
 
 def build_open_command(current_payload: str, zone_addr: int, duration_seconds: int) -> str:
@@ -72,12 +79,12 @@ def build_open_command(current_payload: str, zone_addr: int, duration_seconds: i
         return current_payload
     while len(b) <= DURATION_BYTE_OFFSET + 1:
         b.append(0x00)
-    if len(b) > PAYLOAD_SEQUENCE_BYTE_OFFSET:
-        b[PAYLOAD_SEQUENCE_BYTE_OFFSET] = (b[PAYLOAD_SEQUENCE_BYTE_OFFSET] + 1) & 0xFF
-    b[ZONE_FLAG_BYTE_OFFSET] = ZONE_RUNNING_FLAG | (zone_addr & 0x0F)
+    current_flag = b[ZONE_FLAG_BYTE_OFFSET] if len(b) > ZONE_FLAG_BYTE_OFFSET else 0x00
+    running_flag = next((flag for flag in ZONE_RUNNING_FLAGS if current_flag & flag), ZONE_RUNNING_FLAGS[0])
+    b[ZONE_FLAG_BYTE_OFFSET] = running_flag | (zone_addr & 0x0F)
     struct.pack_into("<H", b, DURATION_BYTE_OFFSET, duration_seconds)
     if len(b) >= STOP_TS_BYTE_OFFSET + 4:
-        struct.pack_into("<I", b, STOP_TS_BYTE_OFFSET, int(time.time()) + duration_seconds)
+        struct.pack_into("<I", b, STOP_TS_BYTE_OFFSET, homgar_now() + duration_seconds)
     return f"{prefix}#{b.hex().upper()}"
 
 
@@ -89,9 +96,6 @@ def build_close_command(current_payload: str) -> str:
         b = bytearray(bytes.fromhex(hex_str))
     except ValueError:
         return current_payload
-    if len(b) > PAYLOAD_SEQUENCE_BYTE_OFFSET and len(b) > ZONE_FLAG_BYTE_OFFSET:
-        if b[ZONE_FLAG_BYTE_OFFSET] & ZONE_RUNNING_FLAG:
-            b[PAYLOAD_SEQUENCE_BYTE_OFFSET] = (b[PAYLOAD_SEQUENCE_BYTE_OFFSET] - 1) & 0xFF
     if len(b) > ZONE_FLAG_BYTE_OFFSET:
         b[ZONE_FLAG_BYTE_OFFSET] = 0x00
     if len(b) >= STOP_TS_BYTE_OFFSET + 4:
@@ -258,36 +262,209 @@ class HomGarMQTTClient:
         with self._lock:
             return self._current_payloads.get(f"{hub_mid}_{d_key}", f"11#{'00' * 52}")
 
-    def send_open(self, hub_mid, timer_addr: int, zone_addr: int, duration_seconds: int, sid: int = 0) -> bool:
-        d_key = f"D{str(timer_addr).zfill(2)}"
-        new_payload = build_open_command(self.get_current_payload(hub_mid, d_key), zone_addr, duration_seconds)
-        return self._publish(hub_mid, d_key, new_payload, sid=sid)
+    def _refresh_payload(self, hub_mid, d_key: str) -> str:
+        """Refresh the base Dxx payload from the cloud before sending commands."""
+        if not hasattr(self, "_rest_client") or not self._rest_client:
+            return self.get_current_payload(hub_mid, d_key)
+        try:
+            payloads = self._rest_client.get_current_payloads(hub_mid)
+            fresh_payload = payloads.get(d_key)
+            if fresh_payload and "#" in fresh_payload:
+                self.set_current_payload(hub_mid, d_key, fresh_payload)
+                return fresh_payload
+        except Exception as e:
+            _LOGGER.warning("HomGar payload refresh failed for hub=%s %s: %s", hub_mid, d_key, e)
+        return self.get_current_payload(hub_mid, d_key)
 
-    def send_close(self, hub_mid, timer_addr: int, sid: int = 0) -> bool:
+    def set_current_payload(self, hub_mid, d_key: str, payload: str) -> None:
+        with self._lock:
+            self._current_payloads[f"{hub_mid}_{d_key}"] = payload
+
+    def send_open(
+        self,
+        hub_mid,
+        timer_addr: int,
+        zone_addr: int,
+        duration_seconds: int,
+        *,
+        product_key: str,
+        device_name: str,
+        sid: int = 0,
+    ) -> bool:
         d_key = f"D{str(timer_addr).zfill(2)}"
-        new_payload = build_close_command(self.get_current_payload(hub_mid, d_key))
-        return self._publish(hub_mid, d_key, new_payload, sid=sid)
+        new_payload = build_open_command(self._refresh_payload(hub_mid, d_key), zone_addr, duration_seconds)
+        if timer_addr > 1:
+            return self._publish_sub_update(
+                hub_mid,
+                d_key,
+                new_payload,
+                timer_addr=timer_addr,
+                zone_addr=zone_addr,
+                sid=sid,
+                action="OPEN",
+            )
+        return self._publish_open(
+            hub_mid,
+            d_key,
+            new_payload,
+            timer_addr=timer_addr,
+            zone_addr=zone_addr,
+            duration_seconds=duration_seconds,
+            product_key=product_key,
+            device_name=device_name,
+            sid=sid,
+        )
+
+    def send_close(
+        self,
+        hub_mid,
+        timer_addr: int,
+        zone_addr: int,
+        *,
+        product_key: str,
+        device_name: str,
+        sid: int = 0,
+    ) -> bool:
+        d_key = f"D{str(timer_addr).zfill(2)}"
+        if timer_addr > 1:
+            close_payload = build_close_command(self._refresh_payload(hub_mid, d_key))
+            return self._publish_sub_update(
+                hub_mid,
+                d_key,
+                close_payload,
+                timer_addr=timer_addr,
+                zone_addr=zone_addr,
+                sid=sid,
+                action="CLOSE",
+            )
+        return self._publish_close(
+            hub_mid,
+            d_key,
+            timer_addr=timer_addr,
+            zone_addr=zone_addr,
+            product_key=product_key,
+            device_name=device_name,
+            sid=sid,
+        )
 
     def set_rest_client(self, rest_client) -> None:
-        """Set the REST client for sending commands via /app/device/sub/update."""
+        """Set the REST client for sending gateway commands via REST."""
         self._rest_client = rest_client
 
-    def _publish(self, hub_mid, d_key: str, payload_hex: str, sid: int = 0) -> bool:
-        """Send command via REST API (/app/device/sub/update) — the correct control path.
+    def _apply_returned_state(self, hub_mid, d_key: str, payload_hex: str | None) -> None:
+        if not payload_hex or "#" not in payload_hex:
+            return
+        self.set_current_payload(hub_mid, d_key, payload_hex)
+        decoded = decode_d01(payload_hex)
+        if decoded:
+            self._on_state_update(f"{hub_mid}_{d_key}", decoded)
 
-        IMPORTANT: Publishing to the user-level Alibaba IoT MQTT topic does NOT reach
-        the physical hub. The hub listens on its own device topic which requires the
-        hub's device secret (unavailable via API). The HomGar REST endpoint
-        /app/device/sub/update relays commands server-side to the hub.
-        """
-        if not hasattr(self, '_rest_client') or not self._rest_client:
+    def _publish_sub_update(
+        self,
+        hub_mid,
+        d_key: str,
+        payload_hex: str,
+        *,
+        timer_addr: int,
+        zone_addr: int,
+        sid: int,
+        action: str,
+    ) -> bool:
+        if not hasattr(self, "_rest_client") or not self._rest_client:
             _LOGGER.error("HomGar: REST client not set, cannot send command")
             return False
         try:
             result = self._rest_client.set_sub_device_param(sid, hub_mid, payload_hex)
-            _LOGGER.info("HomGar REST command hub=%s sid=%s d_key=%s result=%s",
-                         hub_mid, sid, d_key, result)
+            if result:
+                self._apply_returned_state(hub_mid, d_key, payload_hex)
+            _LOGGER.info(
+                "HomGar sub/update %s hub=%s sid=%s addr=%s port=%s result=%s",
+                action,
+                hub_mid,
+                sid,
+                timer_addr,
+                zone_addr,
+                result,
+            )
             return result
         except Exception as e:
-            _LOGGER.error("HomGar REST command failed: %s", e)
+            _LOGGER.error("HomGar sub/update %s failed: %s", action, e)
+            return False
+
+    def _publish_open(
+        self,
+        hub_mid,
+        d_key: str,
+        payload_hex: str,
+        *,
+        timer_addr: int,
+        zone_addr: int,
+        duration_seconds: int,
+        product_key: str,
+        device_name: str,
+        sid: int = 0,
+    ) -> bool:
+        if not hasattr(self, '_rest_client') or not self._rest_client:
+            _LOGGER.error("HomGar: REST client not set, cannot send command")
+            return False
+        try:
+            returned_state = self._rest_client.control_work_mode(
+                mid=hub_mid,
+                product_key=product_key,
+                device_name=device_name,
+                mode=1,
+                addr=timer_addr,
+                port=zone_addr,
+                param=payload_hex,
+                duration=duration_seconds,
+            )
+            self._apply_returned_state(hub_mid, d_key, returned_state or payload_hex)
+            _LOGGER.info(
+                "HomGar controlWorkMode OPEN hub=%s sid=%s addr=%s port=%s",
+                hub_mid,
+                sid,
+                timer_addr,
+                zone_addr,
+            )
+            return True
+        except Exception as e:
+            _LOGGER.error("HomGar controlWorkMode OPEN failed: %s", e)
+            return False
+
+    def _publish_close(
+        self,
+        hub_mid,
+        d_key: str,
+        *,
+        timer_addr: int,
+        zone_addr: int,
+        product_key: str,
+        device_name: str,
+        sid: int = 0,
+    ) -> bool:
+        if not hasattr(self, '_rest_client') or not self._rest_client:
+            _LOGGER.error("HomGar: REST client not set, cannot send command")
+            return False
+        try:
+            returned_state = self._rest_client.control_work_mode(
+                mid=hub_mid,
+                product_key=product_key,
+                device_name=device_name,
+                mode=0,
+                addr=timer_addr,
+                port=zone_addr,
+                param="",
+                duration=0,
+            )
+            self._apply_returned_state(hub_mid, d_key, returned_state or build_close_command(self.get_current_payload(hub_mid, d_key)))
+            _LOGGER.info(
+                "HomGar controlWorkMode CLOSE hub=%s sid=%s addr=%s port=%s",
+                hub_mid,
+                sid,
+                timer_addr,
+                zone_addr,
+            )
+            return True
+        except Exception as e:
+            _LOGGER.error("HomGar controlWorkMode CLOSE failed: %s", e)
             return False
