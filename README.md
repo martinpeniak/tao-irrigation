@@ -33,6 +33,10 @@ Restart HA. All zone switches and duration entities appear automatically.
 - Real-time valve state via Alibaba IoT MQTT
 - Live Trees Auto confirmation uses pump power, not HomGar state, because HomGar
   state frequently lags or stays null while a valve is physically running
+- Live Trees Auto queue on Home Assistant is now:
+  `First Year Trees -> Orchard 2 -> Nebulizer + Papaya 40 -> Oliver's Walk`
+- Papaya 40 no longer runs as its own standalone queue step in Trees Auto; it is
+  started together with Nebulizer and shut down with that branch
 - Measured Papaya 40 latency on 2026-04-06:
   - pump start lag after `switch.turn_on`: about 38 seconds
   - final pump idle after `switch.turn_off`: about 50 seconds

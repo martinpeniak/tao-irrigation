@@ -19,6 +19,10 @@ Component path on HA: `/homeassistant/custom_components/homgar_timers/`
 - Payload codec (build_open/close_command) is correct
 - Live irrigation confirmation already uses pump power instead of HomGar state for
   zone-start success, because HomGar state often stays null or stale
+- Live Trees Auto queue on HA is now:
+  `First Year Trees -> Orchard 2 -> Nebulizer + Papaya 40 -> Oliver's Walk`
+- Papaya 40 is no longer queued as a standalone Trees Auto zone. It now runs as a
+  companion branch whenever Nebulizer runs, and Oliver's Walk follows that branch.
 - Measured on 2026-04-06 during isolated Papaya 40 testing:
   - start lag from `switch.turn_on` to pump rise: about 37.6 seconds
   - final stop lag from `switch.turn_off` to pump idle: about 50.4 seconds
