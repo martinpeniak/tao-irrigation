@@ -28,6 +28,7 @@ except ImportError:
     PAHO_AVAILABLE = False
 
 from .const import (
+    DEVICE_CONTROL_COOLDOWN_SECONDS,
     DURATION_BYTE_OFFSET,
     HOMGAR_EPOCH_OFFSET,
     STOP_TS_BYTE_OFFSET,
@@ -115,7 +116,9 @@ class HomGarMQTTClient:
         self._connected = False
         self._lock = threading.Lock()
         self._client_lock = threading.Lock()
+        self._command_lock = threading.Lock()
         self._current_payloads: dict[str, str] = {}
+        self._next_command_after: dict[tuple[int, int], float] = {}
         self._reconnect_thread = None
         self._shutdown_requested = False
         self._apply_credentials(iot_credentials)
@@ -280,6 +283,25 @@ class HomGarMQTTClient:
         with self._lock:
             self._current_payloads[f"{hub_mid}_{d_key}"] = payload
 
+    def _wait_for_command_slot(self, hub_mid: int, timer_addr: int) -> None:
+        """Serialise commands per timer so the hub has time to pick up the previous one."""
+        key = (int(hub_mid), int(timer_addr))
+        with self._command_lock:
+            now = time.monotonic()
+            next_allowed = self._next_command_after.get(key, 0.0)
+            wait_seconds = max(0.0, next_allowed - now)
+            reserved_start = max(now, next_allowed)
+            self._next_command_after[key] = reserved_start + DEVICE_CONTROL_COOLDOWN_SECONDS
+
+        if wait_seconds > 0:
+            _LOGGER.info(
+                "HomGar waiting %.1fs before next command for hub=%s timer=%s",
+                wait_seconds,
+                hub_mid,
+                timer_addr,
+            )
+            time.sleep(wait_seconds)
+
     def send_open(
         self,
         hub_mid,
@@ -291,6 +313,7 @@ class HomGarMQTTClient:
         device_name: str,
         sid: int = 0,
     ) -> bool:
+        self._wait_for_command_slot(hub_mid, timer_addr)
         d_key = f"D{str(timer_addr).zfill(2)}"
         new_payload = build_open_command(self._refresh_payload(hub_mid, d_key), zone_addr, duration_seconds)
         if timer_addr > 1:
@@ -325,6 +348,7 @@ class HomGarMQTTClient:
         device_name: str,
         sid: int = 0,
     ) -> bool:
+        self._wait_for_command_slot(hub_mid, timer_addr)
         d_key = f"D{str(timer_addr).zfill(2)}"
         if timer_addr > 1:
             close_payload = build_close_command(self._refresh_payload(hub_mid, d_key))

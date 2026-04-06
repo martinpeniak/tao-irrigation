@@ -9,6 +9,7 @@ configuration.yaml:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -117,20 +118,37 @@ async def _setup_runtime(
                      t["name"], t["mid"], [z["name"] for z in t["zones"]])
     state_store: dict[str, dict] = {}
 
+    def publish_state(
+        store_key: str,
+        decoded: dict | None = None,
+        *,
+        available: bool,
+        source: str,
+        error: str | None = None,
+    ) -> None:
+        state = dict(state_store.get(store_key, {}))
+        if decoded:
+            state.update(decoded)
+        state["_available"] = available
+        state["_last_source"] = source
+        state["_last_error"] = error
+        state["_observed_at"] = time.time()
+        state_store[store_key] = state
+        hass.bus.fire(f"{DOMAIN}_state_update", {"key": store_key, "state": state})
+
     def on_state_update(store_key: str, decoded: dict) -> None:
-        state_store[store_key] = decoded
-        hass.bus.fire(f"{DOMAIN}_state_update", {"key": store_key, "state": decoded})
+        publish_state(store_key, decoded, available=True, source="cloud")
 
     mqtt_client = HomGarMQTTClient(api, iot_creds, on_state_update)
     mqtt_client.set_rest_client(api)  # REST client for valve commands via controlWorkMode
     await hass.async_add_executor_job(_seed_payloads, api, mqtt_client, timers)
-    await hass.async_add_executor_job(_sync_payload_states, api, mqtt_client, timers, on_state_update)
+    await hass.async_add_executor_job(_sync_payload_states, api, mqtt_client, timers, publish_state)
     connected = await hass.async_add_executor_job(mqtt_client.connect)
     if not connected:
         _LOGGER.warning("HomGar MQTT connection failed — controls will optimistically update")
 
     async def poll_states(_now) -> None:
-        await hass.async_add_executor_job(_sync_payload_states, api, mqtt_client, timers, on_state_update)
+        await hass.async_add_executor_job(_sync_payload_states, api, mqtt_client, timers, publish_state)
 
     poll_unsub = async_track_time_interval(
         hass,
@@ -182,7 +200,7 @@ def _sync_payload_states(
     api: HomGarApi,
     mqtt_client: HomGarMQTTClient,
     timers: list[dict],
-    on_state_update,
+    publish_state,
 ) -> None:
     """Poll current hub payloads and feed them into the shared state-update path."""
     d_keys_by_mid: dict[int, set[str]] = {}
@@ -194,16 +212,41 @@ def _sync_payload_states(
             payloads = api.get_current_payloads(mid)
         except HomGarApiError as err:
             _LOGGER.warning("HomGar state poll failed for hub %s: %s", mid, err)
+            for d_key in expected_d_keys:
+                publish_state(
+                    f"{mid}_{d_key}",
+                    available=False,
+                    source="poll_error",
+                    error=str(err),
+                )
             continue
         except Exception as err:  # pragma: no cover - defensive network guard
             _LOGGER.warning("HomGar state poll crashed for hub %s: %s", mid, err)
+            for d_key in expected_d_keys:
+                publish_state(
+                    f"{mid}_{d_key}",
+                    available=False,
+                    source="poll_error",
+                    error=str(err),
+                )
             continue
 
         for d_key in expected_d_keys:
             payload = payloads.get(d_key)
             if not payload:
+                publish_state(
+                    f"{mid}_{d_key}",
+                    available=False,
+                    source="poll_missing",
+                    error="No payload returned for timer state",
+                )
                 continue
             mqtt_client.set_current_payload(mid, d_key, payload)
             decoded = decode_d01(payload)
-            if decoded:
-                on_state_update(f"{mid}_{d_key}", decoded)
+            publish_state(
+                f"{mid}_{d_key}",
+                decoded,
+                available=bool(decoded),
+                source="poll",
+                error=None if decoded else "Could not decode payload",
+            )

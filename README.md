@@ -31,6 +31,13 @@ Restart HA. All zone switches and duration entities appear automatically.
 ✅ Deployed and working on TAO HA (March 2026)
 - 4 timers, 12 zones across Oliver's Orchard, House Garden -2/-3, Oasis
 - Real-time valve state via Alibaba IoT MQTT
+- Live Trees Auto confirmation uses pump power, not HomGar state, because HomGar
+  state frequently lags or stays null while a valve is physically running
+- Measured Papaya 40 latency on 2026-04-06:
+  - pump start lag after `switch.turn_on`: about 38 seconds
+  - final pump idle after `switch.turn_off`: about 50 seconds
+  - live automation now allows up to 200 seconds for pump-start confirmation and
+    uses a 20-second post-stop delay plus a 90-second idle-confirmation window
 
 ## Next steps
 

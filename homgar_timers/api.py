@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
+import time
 import urllib.request
 import urllib.error
 from typing import Any
@@ -19,6 +21,7 @@ from typing import Any
 from .const import (
     HOMGAR_BASE_URL, HOMGAR_LOGIN_PATH,
     HOMGAR_HOMES_PATH, HOMGAR_DEVICES_PATH, HOMGAR_DEVICE_STATUS_PATH, TIMER_MODEL,
+    LOGIN_RATE_LIMIT_BACKOFF_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +58,8 @@ class HomGarApi:
         self._area_code = area_code
         self._token: str | None = None
         self._iot_credentials: dict | None = None
+        self._auth_lock = threading.Lock()
+        self._login_backoff_until = 0.0
 
     def _headers(self) -> dict:
         if not self._token:
@@ -67,6 +72,7 @@ class HomGarApi:
         if params:
             url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
         for attempt in range(2):
+            previous_token = self._token
             req = urllib.request.Request(url, headers=self._headers())
             try:
                 resp = urllib.request.urlopen(req, timeout=15)
@@ -77,13 +83,14 @@ class HomGarApi:
                 return data.get("data")
             if data.get("code") == 1004 and attempt == 0:
                 _LOGGER.warning("HomGar token expired during GET %s; refreshing login", path)
-                self.re_login()
+                self.re_login(previous_token=previous_token)
                 continue
             raise HomGarApiError(f"API error: {data}")
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode()
         for attempt in range(2):
+            previous_token = self._token
             req = urllib.request.Request(
                 HOMGAR_BASE_URL + path,
                 data=body,
@@ -97,7 +104,7 @@ class HomGarApi:
                 raise HomGarApiError(f"HTTP {e.code}: {e.read().decode()[:200]}")
             if data.get("code") == 1004 and attempt == 0:
                 _LOGGER.warning("HomGar token expired during POST %s; refreshing login", path)
-                self.re_login()
+                self.re_login(previous_token=previous_token)
                 continue
             return data
         raise HomGarApiError(f"POST failed after retry: {path}")
@@ -105,6 +112,10 @@ class HomGarApi:
 
     def login(self) -> dict:
         """Login and return Alibaba IoT credentials for MQTT."""
+        with self._auth_lock:
+            return self._login_locked()
+
+    def _login_locked(self) -> dict:
         pwd_md5 = hashlib.md5(self._password.encode("utf-8")).hexdigest()
         device_id = hashlib.md5((self._email + self._area_code).encode("utf-8")).hexdigest()
         payload = json.dumps({
@@ -136,12 +147,29 @@ class HomGarApi:
             "mqtt_host": host_port.split(":")[0],
             "mqtt_port": int(host_port.split(":")[1]) if ":" in host_port else 1883,
         }
+        self._login_backoff_until = 0.0
         _LOGGER.info("HomGar login OK token=%s...", self._token[:10])
         return self._iot_credentials
 
-    def re_login(self) -> dict:
+    def re_login(self, *, previous_token: str | None = None) -> dict:
         """Refresh the auth token and MQTT credentials."""
-        return self.login()
+        with self._auth_lock:
+            if previous_token and self._token and self._token != previous_token and self._iot_credentials:
+                return self._iot_credentials
+
+            now = time.monotonic()
+            if now < self._login_backoff_until:
+                remaining = int(self._login_backoff_until - now)
+                raise HomGarApiError(
+                    f"Login backoff active for {remaining}s after recent HomGar rate limit"
+                )
+
+            try:
+                return self._login_locked()
+            except HomGarApiError as err:
+                if "operate too frequently" in str(err) or "'code': 9993" in str(err):
+                    self._login_backoff_until = time.monotonic() + LOGIN_RATE_LIMIT_BACKOFF_SECONDS
+                raise
 
     @property
     def iot_credentials(self) -> dict | None:

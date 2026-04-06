@@ -17,6 +17,14 @@ Component path on HA: `/homeassistant/custom_components/homgar_timers/`
 - Water pump load is visible when valve opens — physical confirmation works
 - MQTT state updates from hub arrive on `/sys/{productKey}/{deviceName}/thing/service/property/set`
 - Payload codec (build_open/close_command) is correct
+- Live irrigation confirmation already uses pump power instead of HomGar state for
+  zone-start success, because HomGar state often stays null or stale
+- Measured on 2026-04-06 during isolated Papaya 40 testing:
+  - start lag from `switch.turn_on` to pump rise: about 37.6 seconds
+  - final stop lag from `switch.turn_off` to pump idle: about 50.4 seconds
+  - live Trees Auto now allows up to 200 seconds for pump-start confirmation
+  - a 20-second post-stop settle delay plus a 90-second idle-confirmation window
+    is a safer fit than the previous 12-second + 45-second stop handling
 
 ---
 
