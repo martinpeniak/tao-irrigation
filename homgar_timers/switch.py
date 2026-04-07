@@ -196,8 +196,9 @@ class HomGarZoneSwitch(SwitchEntity):
         if self._assumed_state and self._pending_target_is_on is True and now < self._pending_state_until:
             if active_zone == self._zone_addr:
                 self._is_on = True
-                self._assumed_state = False
-                self._pending_target_is_on = None
+                # Keep the optimistic run window active even after the first positive
+                # confirmation. HomGar often regresses to a null active_zone on the
+                # next poll while the valve is still physically open.
             elif active_zone not in (None, self._zone_addr):
                 self._is_on = False
                 self._assumed_state = False
