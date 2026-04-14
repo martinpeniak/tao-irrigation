@@ -1,4 +1,15 @@
 # tao-irrigation
+## Canonical Status
+
+This standalone repo is no longer the canonical source of truth.
+
+Canonical home now:
+- repo: `https://github.com/martinpeniak/tao-ops`
+- path: `home-assistant/irrigation/`
+
+Use `tao-ops` for all future durable irrigation changes, docs, and agent handoff work.
+Treat this repo as a migration source or archive unless explicitly needed for history.
+
 
 Smart irrigation control for Project TAO — a fully off-grid solar-powered property in Oliva, Valencia, Spain.
 
